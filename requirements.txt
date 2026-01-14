@@ -11,6 +11,7 @@ dashscope
 imageio-ffmpeg
 scikit-image   
 loguru
+misaki[en]==0.7.17
 gradio>=5.0.0
 numpy>=1.23.5,<2
 xfuser>=0.4.1

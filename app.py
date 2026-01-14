@@ -254,7 +254,7 @@ def _parse_args():
 
 
 def custom_init(device, wav2vec):    
-    audio_encoder = Wav2Vec2Model.from_pretrained(wav2vec, local_files_only=True).to(device)
+    audio_encoder = Wav2Vec2Model.from_pretrained(wav2vec, local_files_only=True, attn_implementation='eager').to(device)
     audio_encoder.feature_extractor._freeze_parameters()
     wav2vec_feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(wav2vec, local_files_only=True)
     return wav2vec_feature_extractor, audio_encoder
@@ -767,7 +767,7 @@ def run_graio_demo(args):
                             label="Diffusion steps",
                             minimum=1,
                             maximum=1000,
-                            value=8,
+                            value=args.sample_steps,
                             step=1)
                         seed = gr.Slider(
                             label="Seed",
@@ -822,12 +822,213 @@ def run_graio_demo(args):
                 )
 
 
-        run_i2v_button.click(
-            fn=generate_video,
-            inputs=[img2vid_image, vid2vid_vid, task_mode, img2vid_prompt, n_prompt, img2vid_audio_1, img2vid_audio_2,sd_steps, seed, text_guide_scale, audio_guide_scale, mode_selector, tts_text, resolution_select, human1_voice, human2_voice],
-            outputs=[result_gallery],
-        )
-    demo.launch(server_name="0.0.0.0", debug=True, server_port=8418, share=True)
+        # Decide which generate function to use based on world_size
+        if world_size > 1:
+            # Define distributed generate function for multi-GPU mode
+            def distributed_generate_video(img2vid_image, vid2vid_vid, task_mode, img2vid_prompt, n_prompt, img2vid_audio_1, img2vid_audio_2,
+                            sd_steps, seed, text_guide_scale, audio_guide_scale, mode_selector, tts_text, resolution_select, human1_voice, human2_voice):
+                """Rank 0 version of generate_video that broadcasts to other ranks"""
+                input_data = {}
+                input_data["prompt"] = img2vid_prompt
+                if task_mode=='VideoDubbing':
+                    input_data["cond_video"] = vid2vid_vid
+                else:
+                    input_data["cond_video"] = img2vid_image
+                person = {}
+                if mode_selector == "Single Person(Local File)":
+                    person['person1'] = img2vid_audio_1
+                elif mode_selector == "Single Person(TTS)":
+                    tts_audio = {}
+                    tts_audio['text'] = tts_text
+                    tts_audio['human1_voice'] = human1_voice
+                    input_data["tts_audio"] = tts_audio
+                elif mode_selector == "Multi Person(Local File, audio add)":
+                    person['person1'] = img2vid_audio_1
+                    person['person2'] = img2vid_audio_2
+                    input_data["audio_type"] = 'add'
+                elif mode_selector == "Multi Person(Local File, audio parallel)":
+                    person['person1'] = img2vid_audio_1
+                    person['person2'] = img2vid_audio_2
+                    input_data["audio_type"] = 'para'
+                else:
+                    tts_audio = {}
+                    tts_audio['text'] = tts_text
+                    tts_audio['human1_voice'] = human1_voice
+                    tts_audio['human2_voice'] = human2_voice
+                    input_data["tts_audio"] = tts_audio
+                    
+                input_data["cond_audio"] = person
+
+                if 'Local File' in mode_selector:
+                    if len(input_data['cond_audio'])==2:
+                        new_human_speech1, new_human_speech2, sum_human_speechs = audio_prepare_multi(input_data['cond_audio']['person1'], input_data['cond_audio']['person2'], input_data['audio_type'])
+                        audio_embedding_1 = get_embedding(new_human_speech1, wav2vec_feature_extractor, audio_encoder)
+                        audio_embedding_2 = get_embedding(new_human_speech2, wav2vec_feature_extractor, audio_encoder)
+                        emb1_path = os.path.join(args.audio_save_dir, '1.pt')
+                        emb2_path = os.path.join(args.audio_save_dir, '2.pt')
+                        sum_audio = os.path.join(args.audio_save_dir, 'sum.wav')
+                        sf.write(sum_audio, sum_human_speechs, 16000)
+                        torch.save(audio_embedding_1, emb1_path)
+                        torch.save(audio_embedding_2, emb2_path)
+                        input_data['cond_audio']['person1'] = emb1_path
+                        input_data['cond_audio']['person2'] = emb2_path
+                        input_data['video_audio'] = sum_audio
+                    elif len(input_data['cond_audio'])==1:
+                        human_speech = audio_prepare_single(input_data['cond_audio']['person1'])
+                        audio_embedding = get_embedding(human_speech, wav2vec_feature_extractor, audio_encoder)
+                        emb_path = os.path.join(args.audio_save_dir, '1.pt')
+                        sum_audio = os.path.join(args.audio_save_dir, 'sum.wav')
+                        sf.write(sum_audio, human_speech, 16000)
+                        torch.save(audio_embedding, emb_path)
+                        input_data['cond_audio']['person1'] = emb_path
+                        input_data['video_audio'] = sum_audio
+                elif 'TTS' in mode_selector:
+                    if 'human2_voice' not in input_data['tts_audio'].keys():
+                        new_human_speech1, sum_audio = process_tts_single(input_data['tts_audio']['text'], args.audio_save_dir, input_data['tts_audio']['human1_voice'])
+                        audio_embedding_1 = get_embedding(new_human_speech1, wav2vec_feature_extractor, audio_encoder)
+                        emb1_path = os.path.join(args.audio_save_dir, '1.pt')
+                        torch.save(audio_embedding_1, emb1_path)
+                        input_data['cond_audio']['person1'] = emb1_path
+                        input_data['video_audio'] = sum_audio
+                    else:
+                        new_human_speech1, new_human_speech2, sum_audio = process_tts_multi(input_data['tts_audio']['text'], args.audio_save_dir, input_data['tts_audio']['human1_voice'], input_data['tts_audio']['human2_voice'])
+                        audio_embedding_1 = get_embedding(new_human_speech1, wav2vec_feature_extractor, audio_encoder)
+                        audio_embedding_2 = get_embedding(new_human_speech2, wav2vec_feature_extractor, audio_encoder)
+                        emb1_path = os.path.join(args.audio_save_dir, '1.pt')
+                        emb2_path = os.path.join(args.audio_save_dir, '2.pt')
+                        torch.save(audio_embedding_1, emb1_path)
+                        torch.save(audio_embedding_2, emb2_path)
+                        input_data['cond_audio']['person1'] = emb1_path
+                        input_data['cond_audio']['person2'] = emb2_path
+                        input_data['video_audio'] = sum_audio
+
+                # Calculate audio duration and max frames
+                audio_path = input_data['video_audio']
+                audio_data, audio_sr = sf.read(audio_path)
+                audio_duration = len(audio_data) / audio_sr
+                max_frames_calculated = int((audio_duration + 1) * 25)
+                logging.info(f"Audio Duration: {audio_duration}s, Calculated Max Frames: {max_frames_calculated}")
+
+                logging.info("Generating video (distributed) ...")
+                import tempfile
+                temp_out_video = tempfile.mktemp(suffix=".mp4")
+                
+                # Prepare generation parameters to broadcast
+                gen_params = {
+                    'input_data': input_data,
+                    'resolution_select': resolution_select,
+                    'sd_steps': sd_steps,
+                    'text_guide_scale': text_guide_scale,
+                    'audio_guide_scale': audio_guide_scale,
+                    'seed': seed,
+                    'n_prompt': n_prompt,
+                    'max_frames_num': args.frame_num if args.mode == 'clip' else max_frames_calculated,
+                    'temp_out_video': temp_out_video,
+                }
+                
+                # Broadcast generation request to all ranks
+                dist.broadcast_object_list([gen_params], src=0)
+                
+                # Rank 0 also participates in generation
+                video = wan_i2v.generate_infinitetalk(
+                    input_data,
+                    size_buckget=resolution_select,
+                    motion_frame=args.motion_frame,
+                    frame_num=args.frame_num,
+                    shift=args.sample_shift,
+                    sampling_steps=sd_steps,
+                    text_guide_scale=text_guide_scale,
+                    audio_guide_scale=audio_guide_scale,
+                    seed=seed,
+                    n_prompt=n_prompt,
+                    offload_model=args.offload_model,
+                    max_frames_num=args.frame_num if args.mode == 'clip' else max_frames_calculated,
+                    color_correction_strength=args.color_correction_strength,
+                    stream_save_path=temp_out_video,
+                    extra_args=args,
+                )
+                
+                # Wait for all ranks to complete
+                dist.barrier()
+
+                if args.save_file is None:
+                    formatted_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    formatted_prompt = input_data['prompt'].replace(" ", "_").replace("/", "_")[:50]
+                    args.save_file = f"{args.task}_{args.size.replace('*','x') if sys.platform=='win32' else args.size}_{args.ulysses_size}_{args.ring_size}_{formatted_prompt}_{formatted_time}"
+                
+                logging.info(f"Saving generated video to {args.save_file}.mp4")
+                save_video_ffmpeg(video, args.save_file, [input_data['video_audio']], high_quality_save=False)
+                logging.info("Finished.")
+
+                return args.save_file + '.mp4'
+            
+            # Use distributed version for multi-GPU
+            run_i2v_button.click(
+                fn=distributed_generate_video,
+                inputs=[img2vid_image, vid2vid_vid, task_mode, img2vid_prompt, n_prompt, img2vid_audio_1, img2vid_audio_2, sd_steps, seed, text_guide_scale, audio_guide_scale, mode_selector, tts_text, resolution_select, human1_voice, human2_voice],
+                outputs=[result_gallery],
+            )
+        else:
+            # Single GPU mode - use regular generate_video
+            run_i2v_button.click(
+                fn=generate_video,
+                inputs=[img2vid_image, vid2vid_vid, task_mode, img2vid_prompt, n_prompt, img2vid_audio_1, img2vid_audio_2, sd_steps, seed, text_guide_scale, audio_guide_scale, mode_selector, tts_text, resolution_select, human1_voice, human2_voice],
+                outputs=[result_gallery],
+            )
+    
+    # After demo is created, handle multi-GPU launch
+    if world_size > 1:
+        def distributed_generate_worker():
+            """Worker function for non-rank-0 processes to participate in distributed generation"""
+            while True:
+                try:
+                    # Wait for generation request broadcast from rank 0
+                    request = [None]
+                    dist.broadcast_object_list(request, src=0)
+                    
+                    if request[0] is None:
+                        continue
+                    if request[0] == "SHUTDOWN":
+                        break
+                    
+                    gen_params = request[0]
+                    logging.info(f"Rank {rank}: Received generation request")
+                    
+                    # Participate in distributed generation
+                    video = wan_i2v.generate_infinitetalk(
+                        gen_params['input_data'],
+                        size_buckget=gen_params['resolution_select'],
+                        motion_frame=args.motion_frame,
+                        frame_num=args.frame_num,
+                        shift=args.sample_shift,
+                        sampling_steps=gen_params['sd_steps'],
+                        text_guide_scale=gen_params['text_guide_scale'],
+                        audio_guide_scale=gen_params['audio_guide_scale'],
+                        seed=gen_params['seed'],
+                        n_prompt=gen_params.get('n_prompt', ''),
+                        offload_model=args.offload_model,
+                        max_frames_num=gen_params['max_frames_num'],
+                        color_correction_strength=args.color_correction_strength,
+                        stream_save_path=gen_params.get('temp_out_video', None),
+                        extra_args=args,
+                    )
+                    
+                    # Signal completion
+                    dist.barrier()
+                    logging.info(f"Rank {rank}: Generation complete")
+                    
+                except Exception as e:
+                    logging.error(f"Rank {rank}: Error in distributed generation: {e}")
+                    continue
+        
+        if rank == 0:
+            demo.launch(server_name="0.0.0.0", debug=True, server_port=8418, share=True)
+        else:
+            # Non-rank-0 processes run the distributed worker
+            distributed_generate_worker()
+    else:
+        # Single GPU mode - just launch Gradio normally
+        demo.launch(server_name="0.0.0.0", debug=True, server_port=8418, share=True)
 
         
 
